@@ -4,13 +4,17 @@ Blocks Claude Code and Claude Desktop whenever your public IP is in Iran, so no 
 
 ## Install / uninstall
 
+**From a release (no Xcode tools needed):** download `ClaudeGuard-macos-universal.zip` from the [Releases page](https://github.com/mohammadalikashani/ClaudeDisconnector/releases). It runs on Apple Silicon and Intel Macs. Unzip it, then in Terminal:
+
 ```bash
-cd macos
+cd ~/Downloads/ClaudeGuard-macos-universal
 ./install.sh      # run as your normal user; asks for your admin password
 ./uninstall.sh    # removes everything and lifts all blocks
 ```
 
-Requires the Xcode Command Line Tools (`xcode-select --install`). macOS 13+.
+**From source:** the same scripts in the `macos` folder build everything first. This requires the Xcode Command Line Tools (`xcode-select --install`). `./package.sh` builds the release zip.
+
+macOS 13+.
 
 ## How it works
 

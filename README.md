@@ -19,22 +19,13 @@ It runs as a background service. It checks your public IP every 15 seconds and o
 
 ## Quick start
 
-**macOS**
+Download the zip for your system from the [Releases page](https://github.com/mohammadalikashani/ClaudeDisconnector/releases).
 
-```bash
-cd macos
-./install.sh      # run as your normal user; asks for your admin password
-./uninstall.sh    # removes everything and lifts all blocks
-```
+**macOS:** use `ClaudeGuard-macos-universal.zip` (Apple Silicon and Intel). Unzip it, then in Terminal run `./install.sh` from that folder, as your normal user. It asks for your admin password. `./uninstall.sh` removes everything.
 
-**Windows**
+**Windows:** use `ClaudeGuard-windows-amd64.zip` (most PCs) or `-arm64` (ARM PCs). Unzip it, double-click `install.cmd` and approve the admin prompt. `uninstall.cmd` removes everything.
 
-```bash
-cd windows
-./build.sh        # outputs dist/ClaudeGuard-windows-{amd64,arm64}.zip
-```
-
-Unzip the archive for your CPU on the Windows PC and double-click `install.cmd`. Approve the admin prompt. `uninstall.cmd` removes everything.
+**From source:** on macOS, run `macos/install.sh`, which builds first and needs the Xcode Command Line Tools. For Windows, run `windows/build.sh` (needs Go 1.22+) to make the zips.
 
 See the platform READMEs for how each piece works, the CLI commands, supported VPN/proxy setups and limitations.
 

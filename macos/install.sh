@@ -8,8 +8,14 @@ if [[ $EUID -eq 0 ]]; then
   exit 1
 fi
 
-echo "==> Building"
-./build.sh
+if [[ -f Package.swift ]]; then
+  echo "==> Building"
+  ./build.sh
+else
+  # Release zip: prebuilt binaries are included. Clear the download quarantine flag.
+  echo "==> Using prebuilt binaries"
+  /usr/bin/xattr -dr com.apple.quarantine . 2>/dev/null || true
+fi
 
 echo
 echo "==> Current location check"

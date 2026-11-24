@@ -11,6 +11,7 @@ __pycache__/
 # macOS build output
 macos/.build/
 macos/build/
+macos/dist/
 
 # Windows build output
 windows/dist/
