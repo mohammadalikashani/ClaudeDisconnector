@@ -1,0 +1,17 @@
+# Python / IDE
+.venv/
+venv/
+__pycache__/
+.idea/
+.DS_Store
+
+# Claude Code local settings
+.claude/settings.local.json
+
+# macOS build output
+macos/.build/
+macos/build/
+
+# Windows build output
+windows/dist/
+*.exe
