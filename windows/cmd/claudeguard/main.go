@@ -31,6 +31,9 @@ const usage = `usage: claudeguard <command>
   claude-proxy on [url] | off | status
                  route Claude Code through v2ray's HTTP proxy (system-proxy mode);
                  Claude Code ignores the Windows system proxy, so this sets HTTPS_PROXY for it
+  remote-api list | add <host:port> [secret] | remove <host:port>
+                 a Clash API on another device you use as your proxy, e.g. Clash Meta for
+                 Android with Allow LAN (proxy hosts are probed on 9090/9097 anyway) (admin)
   hook           Claude Code UserPromptSubmit hook (used by Claude Code)
   service        run the protection service (started by Windows; foreground if run by hand as admin)
   cleanup        remove all blocks without uninstalling (admin)
@@ -118,6 +121,15 @@ func main() {
 		hook()
 	case "claude-proxy":
 		claudeProxy(args[1:])
+	case "remote-api":
+		out, err := core.RemoteAPICommand(args[1:], core.RemoteAPIsFile())
+		if err != nil {
+			fail("%v", err)
+		}
+		fmt.Print(out)
+		if len(args) > 1 && args[1] != "list" {
+			_ = win.SignalEvent(core.RefreshEvent)
+		}
 	case "cleanup":
 		if !win.IsElevated() {
 			fail("run from an Administrator terminal")
@@ -140,13 +152,23 @@ func runCheck() core.VerdictKind {
 	defer cancel()
 	ni, local := win.NetInfo()
 	fmt.Printf("network : %s\n", ni.Summary())
-	home, appData := win.UserDirs()
+	home, appData, localAppData := win.UserDirs3()
 	procs := win.ProxyProcesses()
-	apps := core.DetectProxyApps(ctx, append(procs.Configs, core.CandidateConfigs(home, appData, procs.Dirs)...), procs.IsRunning)
+	proxies := []string{core.ClaudeSettingsProxyIn(home)}
+	if sp := win.SystemProxy(); sp.Enabled() || sp.PAC != "" {
+		rt := core.ResolveDesktopRoute(ctx, sp)
+		proxies = append(proxies, rt.Proxy, rt.HTTP)
+	}
+	cands := append(core.AllCandidates(home, appData, localAppData, procs),
+		core.RemoteAPICandidates(proxies, core.LoadRemoteAPIs(core.RemoteAPIsFile()))...)
+	apps := core.DetectProxyApps(ctx, cands, procs.IsRunning)
 	if len(apps) == 0 {
-		fmt.Println("apps    : no running Clash / sing-box / Xray / V2Ray detected")
+		fmt.Println("apps    : no running Clash / sing-box / Xray / V2Ray / Hiddify / NekoBox / FlClash / Karing / Mihomo Party / Nyanpasu detected")
 	}
 	for _, a := range apps {
+		if a.Remote != "" {
+			fmt.Printf("apps    : (remote device %s: its DIRECT is that device's own connection)\n", a.Remote)
+		}
 		fmt.Printf("apps    : %s\n          source=%s mode=%s tun=%v ports=%v\n          IP-check sites -> %s\n",
 			a.Describe(), a.Source, a.Mode, a.TUN, a.Ports, a.Check.Outcome)
 		if a.Note != "" {

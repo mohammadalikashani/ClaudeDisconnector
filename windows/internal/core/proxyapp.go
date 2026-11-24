@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -17,7 +18,8 @@ import (
 
 // ProxyApp is a detected Clash (mihomo), sing-box or Xray/V2Ray instance and how it routes Claude.
 type ProxyApp struct {
-	Kind       string    `json:"kind"`           // "clash", "sing-box" or "xray"
+	Kind       string    `json:"kind"`           // "clash", "sing-box", "xray" or "nekoray"
+	App        string    `json:"app,omitempty"`  // client name when known (Hiddify, NekoBox, ...)
 	Source     string    `json:"source"`         // config path and/or API address
 	Live       bool      `json:"live"`           // API answered (app is running)
 	Mode       string    `json:"mode,omitempty"` // rule / global / direct
@@ -28,6 +30,9 @@ type ProxyApp struct {
 	Check      HostRoute `json:"check"`                // worst route of the IP-check sites
 	LiveDirect []string  `json:"liveDirect,omitempty"` // live Claude connections going DIRECT
 	Note       string    `json:"note,omitempty"`
+	// Remote: host of another device running the app (e.g. Clash Meta for Android used
+	// as this computer's proxy). Its DIRECT exit is that device's connection.
+	Remote string `json:"remote,omitempty"`
 }
 
 // SendsClaudeDirect: the app definitely routes Claude DIRECT (or a live connection shows it).
@@ -43,10 +48,16 @@ func (a ProxyApp) CheckMisrouted() bool {
 
 // ServesPort reports whether proxyURL (http://127.0.0.1:7890) is one of this app's ports.
 func (a ProxyApp) ServesPort(proxyURL string) bool {
-	hp := strings.TrimPrefix(strings.TrimPrefix(NormalizeProxyURL(proxyURL), "http://"), "socks5://")
-	_, port, ok := strings.Cut(hp, ":")
-	if !ok {
+	host, port := ProxyHostPort(proxyURL)
+	if port == "" {
 		return false
+	}
+	if a.Remote != "" {
+		if !strings.EqualFold(host, a.Remote) {
+			return false
+		}
+	} else if !isLocalAddr(host) {
+		return false // a local app doesn't serve another machine's proxy
 	}
 	for _, p := range a.Ports {
 		if fmt.Sprint(p) == port {
@@ -57,6 +68,9 @@ func (a ProxyApp) ServesPort(proxyURL string) bool {
 }
 
 func (a ProxyApp) Name() string {
+	if a.App != "" {
+		return a.App
+	}
 	switch a.Kind {
 	case "clash":
 		return "Clash"
@@ -90,7 +104,8 @@ func (a ProxyApp) Describe() string {
 // ---------------------------------------------------------------- Clash API
 
 type clashAPI struct {
-	base, secret string
+	base, secret string // base: "http://127.0.0.1:9090" or "unix:/path" / "pipe:\\.\pipe\x" (also the display name)
+	url          string // request URL prefix
 	client       *http.Client
 }
 
@@ -107,12 +122,50 @@ func newAPI(addr, secret string) *clashAPI {
 	if !strings.Contains(addr, "://") {
 		addr = "http://" + addr
 	}
-	return &clashAPI{base: strings.TrimRight(addr, "/"), secret: secret,
+	base := strings.TrimRight(addr, "/")
+	return &clashAPI{base: base, url: base, secret: secret,
 		client: &http.Client{Timeout: 1500 * time.Millisecond, Transport: &http.Transport{Proxy: nil}}}
 }
 
+// newSocketAPI talks to a mihomo API on a unix socket or Windows named pipe
+// (external-controller-unix / external-controller-pipe), as Mihomo Party and Clash
+// Nyanpasu configure it.
+func newSocketAPI(path, secret string) *clashAPI {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return nil
+	}
+	kind := "unix:"
+	if strings.HasPrefix(path, `\\.\pipe\`) || strings.HasPrefix(path, `//./pipe/`) {
+		kind = "pipe:"
+	}
+	tr := &http.Transport{Proxy: nil, DisableKeepAlives: true,
+		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) { return dialLocal(ctx, path) }}
+	return &clashAPI{base: kind + path, url: "http://localhost", secret: secret,
+		client: &http.Client{Timeout: 1500 * time.Millisecond, Transport: tr}}
+}
+
+// controllerAPIs lists the APIs a Clash config exposes: TCP, unix socket (relative
+// paths are relative to the config's folder) and named pipe.
+func controllerAPIs(f *clashFile, cfgPath string) []*clashAPI {
+	var out []*clashAPI
+	if a := newAPI(f.ExternalController, f.Secret); a != nil {
+		out = append(out, a)
+	}
+	if u := strings.TrimSpace(f.ExternalControllerUnix); u != "" {
+		if !filepath.IsAbs(u) && !strings.HasPrefix(u, "/") {
+			u = filepath.Join(filepath.Dir(cfgPath), u)
+		}
+		out = append(out, newSocketAPI(u, f.Secret))
+	}
+	if p := newSocketAPI(f.ExternalControllerPipe, f.Secret); p != nil {
+		out = append(out, p)
+	}
+	return out
+}
+
 func (c *clashAPI) get(ctx context.Context, path string, v any) error {
-	req, err := http.NewRequestWithContext(ctx, "GET", c.base+path, nil)
+	req, err := http.NewRequestWithContext(ctx, "GET", c.url+path, nil)
 	if err != nil {
 		return err
 	}
@@ -267,7 +320,7 @@ func liveDirect(st *apiState) []string {
 				isClaude = true
 			}
 		}
-		if isClaude && len(c.Chains) > 0 && strings.EqualFold(c.Chains[0], "DIRECT") {
+		if isClaude && len(c.Chains) > 0 && (strings.EqualFold(c.Chains[0], "DIRECT") || c.Chains[0] == "bypass") {
 			out = append(out, host)
 		}
 	}
@@ -277,19 +330,23 @@ func liveDirect(st *apiState) []string {
 // ---------------------------------------------------------------- Clash config file
 
 type clashFile struct {
-	ExternalController string                `yaml:"external-controller"`
-	Secret             string                `yaml:"secret"`
-	Mode               string                `yaml:"mode"`
-	MixedPort          int                   `yaml:"mixed-port"`
-	Port               int                   `yaml:"port"`
-	SocksPort          int                   `yaml:"socks-port"`
-	Tun                struct{ Enable bool } `yaml:"tun"`
-	Rules              []string              `yaml:"rules"`
-	ProxyGroups        []struct {
+	ExternalController     string                `yaml:"external-controller"`
+	ExternalControllerUnix string                `yaml:"external-controller-unix"`
+	ExternalControllerPipe string                `yaml:"external-controller-pipe"`
+	Secret                 string                `yaml:"secret"`
+	Mode                   string                `yaml:"mode"`
+	MixedPort              int                   `yaml:"mixed-port"`
+	Port                   int                   `yaml:"port"`
+	SocksPort              int                   `yaml:"socks-port"`
+	Tun                    struct{ Enable bool } `yaml:"tun"`
+	Rules                  []string              `yaml:"rules"`
+	ProxyGroups            []struct {
 		Name    string   `yaml:"name"`
 		Type    string   `yaml:"type"`
 		Proxies []string `yaml:"proxies"`
 	} `yaml:"proxy-groups"`
+	// Selections saved by the GUI (Clash for Windows' list.yml), used without an API.
+	selected map[string]string
 }
 
 // fileResolver resolves without the API: a group's current selection is unknown, so a
@@ -315,21 +372,32 @@ func (f *clashFile) resolver() Resolver {
 		return false
 	}
 	return func(name string) (Outcome, []string, bool) {
-		switch strings.ToUpper(name) {
-		case "DIRECT":
-			return OutDirect, []string{name}, false
-		case "REJECT", "REJECT-DROP":
-			return OutReject, []string{name}, false
-		}
-		if members, ok := groups[name]; ok {
+		var chain []string
+		for i := 0; i < 12; i++ {
+			chain = append(chain, name)
+			switch strings.ToUpper(name) {
+			case "DIRECT":
+				return OutDirect, chain, false
+			case "REJECT", "REJECT-DROP":
+				return OutReject, chain, false
+			}
+			members, ok := groups[name]
+			if !ok {
+				return OutProxy, chain, false
+			}
+			if now := f.selected[name]; now != "" {
+				name = now // saved selection
+				continue
+			}
 			if hasDirect(name, 0) {
-				return OutUnknown, []string{name}, true
+				return OutUnknown, chain, true
 			}
 			if len(members) > 0 {
-				return OutProxy, []string{name, members[0] + "?"}, false
+				return OutProxy, append(chain, members[0]+"?"), false
 			}
+			return OutProxy, chain, false
 		}
-		return OutProxy, []string{name}, false
+		return OutUnknown, chain, true
 	}
 }
 
@@ -599,8 +667,18 @@ func (f *sbFile) resolver(api map[string]apiProxy) Resolver {
 
 // ConfigCandidate is a config file worth looking at.
 type ConfigCandidate struct {
-	Kind string // "clash" or "sing-box"
+	Kind string // "clash", "json" (sing-box or xray), "xray", "nekoray" (settings folder) or "api" (Clash API address)
 	Path string
+	App  string // client name for messages ("Hiddify"), optional
+	// Hints from the client's own settings, used when the core config lacks them.
+	Ports []int
+	TUN   bool
+	API   APIOverride // API given on the core's command line (overrides the config)
+}
+
+// APIOverride is a mihomo API set on the command line (-ext-ctl*, -secret).
+type APIOverride struct {
+	Addr, Unix, Pipe, Secret string
 }
 
 // CandidateConfigs lists well-known config locations under a user's home / AppData,
@@ -608,8 +686,8 @@ type ConfigCandidate struct {
 // "json" files are sing-box or Xray/V2Ray, decided by their content.
 func CandidateConfigs(home, appData string, extraDirs []string) []ConfigCandidate {
 	var c []ConfigCandidate
-	addC := func(p string) { c = append(c, ConfigCandidate{"clash", p}) }
-	addJ := func(p string) { c = append(c, ConfigCandidate{"json", p}) }
+	addC := func(p string) { c = append(c, ConfigCandidate{Kind: "clash", Path: p}) }
+	addJ := func(p string) { c = append(c, ConfigCandidate{Kind: "json", Path: p}) }
 	if home != "" {
 		for _, d := range []string{".config/mihomo", ".config/clash.meta", ".config/clash"} {
 			addC(filepath.Join(home, d, "config.yaml"))
@@ -620,8 +698,6 @@ func CandidateConfigs(home, appData string, extraDirs []string) []ConfigCandidat
 		addJ(filepath.Join(home, ".config/qv2ray/vcore/config.gen.json"))
 		addJ(filepath.Join(home, ".V2rayU/config.json"))
 		mac := filepath.Join(home, "Library/Application Support")
-		addC(filepath.Join(mac, "io.github.clash-verge-rev.clash-verge-rev/clash-verge.yaml"))
-		addC(filepath.Join(mac, "io.github.clash-verge-rev.clash-verge-rev/config.yaml"))
 		addJ(filepath.Join(mac, "app.hiddify.com/data/current-config.json"))
 		for _, v := range []string{"v2rayN/binConfigs", "v2rayN/guiConfigs"} {
 			addJ(filepath.Join(mac, v, "config.json"))
@@ -633,8 +709,6 @@ func CandidateConfigs(home, appData string, extraDirs []string) []ConfigCandidat
 		addJ(filepath.Join(home, ".local/share/v2rayN/binConfigs/config.json"))
 	}
 	if appData != "" {
-		addC(filepath.Join(appData, "io.github.clash-verge-rev.clash-verge-rev", "clash-verge.yaml"))
-		addC(filepath.Join(appData, "io.github.clash-verge-rev.clash-verge-rev", "config.yaml"))
 		addJ(filepath.Join(appData, "Hiddify", "data", "current-config.json"))
 		addJ(filepath.Join(appData, "app.hiddify.com", "data", "current-config.json"))
 		addJ(filepath.Join(appData, "qv2ray", "vcore", "config.gen.json"))
@@ -666,6 +740,12 @@ func DetectProxyApps(ctx context.Context, candidates []ConfigCandidate, running 
 	seenPath := map[string]bool{}
 
 	for _, cand := range candidates {
+		if cand.Kind == "api" {
+			if app := probeAPI(ctx, cand.Path, cand.App, cand.API.Secret, seenAPI); app != nil {
+				apps = append(apps, *app)
+			}
+			continue
+		}
 		path := filepath.Clean(cand.Path)
 		if seenPath[strings.ToLower(path)] {
 			continue
@@ -677,9 +757,9 @@ func DetectProxyApps(ctx context.Context, candidates []ConfigCandidate, running 
 		}
 		kind := cand.Kind
 		var data []byte
-		if st.IsDir() {
+		if st.IsDir() && kind != "nekoray" && kind != "flclash" && kind != "cfw" {
 			kind = "xray" // xray -confdir
-		} else {
+		} else if !st.IsDir() {
 			if data, err = os.ReadFile(path); err != nil || len(data) == 0 {
 				continue
 			}
@@ -691,8 +771,22 @@ func DetectProxyApps(ctx context.Context, candidates []ConfigCandidate, running 
 		switch kind {
 		case "clash":
 			f, err := parseClashFile(data)
-			if err != nil || (len(f.Rules) == 0 && f.ExternalController == "") {
+			if err != nil || (len(f.Rules) == 0 && f.ExternalController == "" && f.ExternalControllerUnix == "" && f.ExternalControllerPipe == "") {
 				continue
+			}
+			if o := cand.API; o != (APIOverride{}) {
+				if o.Addr != "" {
+					f.ExternalController = o.Addr
+				}
+				if o.Unix != "" {
+					f.ExternalControllerUnix = o.Unix
+				}
+				if o.Pipe != "" {
+					f.ExternalControllerPipe = o.Pipe
+				}
+				if o.Secret != "" {
+					f.Secret = o.Secret
+				}
 			}
 			app = evalClash(ctx, cand.Path, f, seenAPI)
 		case "sing-box":
@@ -701,6 +795,12 @@ func DetectProxyApps(ctx context.Context, candidates []ConfigCandidate, running 
 				continue
 			}
 			app = evalSingBox(ctx, cand.Path, &f, seenAPI)
+		case "nekoray":
+			app = evalNekoray(ctx, path, seenAPI)
+		case "flclash":
+			app = evalFlClash(ctx, path, seenAPI, nil)
+		case "cfw":
+			app = evalCFW(ctx, path, cand.API, seenAPI)
 		case "xray":
 			f, err := loadXray(path)
 			if err != nil || len(f.Outbounds) == 0 {
@@ -711,6 +811,15 @@ func DetectProxyApps(ctx context.Context, candidates []ConfigCandidate, running 
 		if app == nil {
 			continue
 		}
+		if cand.App != "" {
+			app.App = cand.App
+		} else if app.App == "" {
+			app.App = AppLabel(path)
+		}
+		if len(app.Ports) == 0 {
+			app.Ports = cand.Ports
+		}
+		app.TUN = app.TUN || cand.TUN
 		if !app.Live && (running == nil || !running(app.Kind)) {
 			continue // config of an app that isn't running
 		}
@@ -719,32 +828,43 @@ func DetectProxyApps(ctx context.Context, candidates []ConfigCandidate, running 
 
 	// Running instances we found no config for: ask the API directly.
 	for _, addr := range DefaultAPIPorts {
-		if seenAPI[addr] {
-			continue
+		if app := probeAPI(ctx, addr, "", "", seenAPI); app != nil {
+			apps = append(apps, *app)
 		}
-		api := newAPI(addr, "")
-		st, err := api.fetch(ctx)
-		if err != nil {
-			continue
-		}
-		seenAPI[addr] = true
-		kind := "clash"
-		if strings.Contains(strings.ToLower(st.version), "sing-box") {
-			kind = "sing-box"
-		}
-		app := ProxyApp{Kind: kind, Source: "API " + api.base, Live: true, Mode: st.mode, TUN: st.tun, MixedPort: st.mixed, Ports: st.ports}
-		if len(st.rules) == 0 && st.mode != "global" && st.mode != "direct" {
-			app.Note = "rules not available from the API (no config file found)"
-			app.Anthropic = HostRoute{Outcome: OutUnknown, Uncertain: true}
-			app.Check = app.Anthropic
-		} else {
-			app.Anthropic, app.Check = evalHosts(st.rules, "MATCH-DEFAULT", st.mode, apiResolver(st.proxies))
-		}
-		app.LiveDirect = liveDirect(st)
-		apps = append(apps, app)
 	}
 	LinkLocalForwards(apps)
 	return apps
+}
+
+// probeAPI asks a Clash-compatible API with no config file known (nil if it doesn't answer).
+func probeAPI(ctx context.Context, addr, appName, secret string, seenAPI map[string]bool) *ProxyApp {
+	api := newAPI(addr, secret)
+	if api == nil || seenAPI[strings.TrimPrefix(api.base, "http://")] {
+		return nil
+	}
+	st, err := api.fetch(ctx)
+	if err != nil {
+		return nil
+	}
+	seenAPI[strings.TrimPrefix(api.base, "http://")] = true
+	kind := "clash"
+	if strings.Contains(strings.ToLower(st.version), "sing-box") {
+		kind = "sing-box"
+	}
+	app := ProxyApp{Kind: kind, App: appName, Source: "API " + api.base, Live: true, Mode: st.mode, TUN: st.tun, MixedPort: st.mixed, Ports: st.ports}
+	if len(st.rules) == 0 && st.mode != "global" && st.mode != "direct" {
+		app.Note = "rules not available from the API (no config file found)"
+		app.Anthropic = HostRoute{Outcome: OutUnknown, Uncertain: true}
+		app.Check = app.Anthropic
+	} else {
+		app.Anthropic, app.Check = evalHosts(st.rules, "MATCH-DEFAULT", st.mode, apiResolver(st.proxies))
+	}
+	app.LiveDirect = liveDirect(st)
+	if host, _, err := net.SplitHostPort(strings.TrimPrefix(api.base, "http://")); err == nil && !isLocalAddr(host) {
+		app.Remote = host
+		app.TUN = false // its TUN is on the other device
+	}
+	return &app
 }
 
 func evalClash(ctx context.Context, path string, f *clashFile, seenAPI map[string]bool) *ProxyApp {
@@ -760,9 +880,14 @@ func evalClash(ctx context.Context, path string, f *clashFile, seenAPI map[strin
 		}
 	}
 	resolve := f.resolver()
-	if api := newAPI(f.ExternalController, f.Secret); api != nil {
+	var notes []string
+	for _, api := range controllerAPIs(f, path) {
+		if app.Live {
+			break
+		}
 		st, err := api.fetch(ctx)
 		if err == nil {
+			app.Note = ""
 			seenAPI[strings.TrimPrefix(api.base, "http://")] = true
 			app.Live, app.Source = true, path+" + API "+api.base
 			if st.mode != "" {
@@ -783,8 +908,18 @@ func evalClash(ctx context.Context, path string, f *clashFile, seenAPI map[strin
 			}
 			app.LiveDirect = liveDirect(st)
 		} else {
-			app.Note = "API " + api.base + ": " + err.Error()
+			notes = append(notes, "API "+api.base+": "+err.Error())
 		}
+	}
+	if !app.Live && len(notes) > 0 {
+		app.Note = strings.Join(notes, "; ")
+	}
+	if len(rules) == 0 && app.Mode != "direct" && app.Mode != "global" {
+		// A config without rules is usually a GUI's partial settings file (the rules live
+		// elsewhere), not what the core runs: don't conclude DIRECT from it.
+		app.Anthropic = HostRoute{Outcome: OutUnknown, Uncertain: true, Rule: "no rules in this file"}
+		app.Check = app.Anthropic
+		return app
 	}
 	app.Anthropic, app.Check = evalHosts(rules, "", app.Mode, resolve)
 	return app

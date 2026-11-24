@@ -99,6 +99,65 @@ Xray has no Clash-style API, so ClaudeGuard reads the core's JSON config: the fi
 - **Chained apps:** when an app hands traffic to a local SOCKS/HTTP port of another app, the chain is followed. Example: v2rayN's TUN (sing-box) forwards to xray on `127.0.0.1:10808`, and xray then sends Claude DIRECT. The result is reported on the TUN app, so the block applies.
 - **V2Ray v5 format** (`"router": {"rule": [...]}`) is read too. It handles `domain` (`Plain`/`Regex`/`RootDomain`/`Full`), `geoDomain`, `geoip` (codes, `cidr`, `inverseMatch`), `portList`/`portRange`, `networks`, `inboundTag`, `balancingTag`/`balancingRule` and `domainStrategy` (`AsIs`, `UseIp`, `IpIfNonMatch`, `IpOnDemand`). Field names can be camelCase or snake_case, and enums can be names or numbers.
 
+
+### Hiddify and NekoRay / NekoBox / Throne
+
+- **Hiddify** is a sing-box client. ClaudeGuard looks through Hiddify's data folders for the generated core config (`current-config.json`) and evaluates it like any sing-box config. It also reads Hiddify's preferences (`shared_preferences.json`, or the `app.hiddify.com` plist on macOS) for:
+  - the Clash API port, which is asked for live selections and live Claude connections;
+  - the mixed port;
+  - TUN mode.
+
+  On macOS, Hiddify keeps its data in a protected group container (`group.apple.hiddify.com`). ClaudeGuard can read it only if `/Library/PrivilegedHelperTools/claudeguardd` has **Full Disk Access** (System Settings → Privacy & Security). Without that, ClaudeGuard still checks Hiddify through its live API (port `16756`) while Hiddify is running.
+- **NekoRay / NekoBox / Throne** give their core its config over gRPC, so it never exists as a file. ClaudeGuard rebuilds the routing from the app's own settings in its `config` folder. That folder is next to the executable (portable Windows installs) or under `~/.config/nekoray`, `~/.config/nekobox` or `~/.config/Throne`.
+  - **Settings read** from `groups/nekobox.json` (or `nekoray.json`): the SOCKS port (default `2080`), the active route profile, and the optional Clash API.
+  - **The active route profile** is in `routes_box/<name>` (sing-box core) or `routes/<name>` (Xray core). It is evaluated in NekoRay's order:
+    1. custom rules;
+    2. block, proxy, then direct domains;
+    3. block, proxy, then direct IPs;
+    4. the default outbound (`proxy`, or `bypass`, which means DIRECT).
+  - **TUN mode:** NekoBox runs a separate sing-box TUN core that forwards to the SOCKS port. ClaudeGuard follows that chain, so a profile that sends Claude to `bypass` gets blocked in TUN mode too.
+
+
+### FlClash and Karing
+
+- **FlClash** is a mihomo (Clash) GUI. ClaudeGuard finds its data folder (`com.follow.clash`, or `com.follow\clash` on Windows) and evaluates the **current profile** (`profiles/<id>.yaml`) the way FlClash runs it. FlClash's own settings are applied on top: mode, mixed port, TUN, external controller and secret. Rules added or replaced through the profile's override settings are applied too. Settings are read from `config.json`, or from older versions' Flutter preferences (`shared_preferences.json`, or a plist on macOS). If FlClash's API is on, its live selections and connections are used as for any Clash.
+- **Karing** is a sing-box GUI. ClaudeGuard searches Karing's folders for the newest full sing-box config (one with inbounds, outbounds and a route, not a subscription file) and evaluates it like any sing-box config, including its Clash API if it has one.
+- On macOS, App Store builds keep their data in protected containers. To read them, give `claudeguardd` Full Disk Access, as for Hiddify.
+
+
+Shadowrocket, Stash, Surge, Quantumult X, Loon and Egern have no Windows versions; the macOS build reads their configs.
+
+
+### Mihomo Party, Clash Nyanpasu, Clash Verge Rev
+
+- **Which file is read:** both apps write the **runtime config** the core actually runs before starting it. ClaudeGuard searches their data folders (`mihomo-party`, `Clash Nyanpasu` / `clash-nyanpasu`, including portable folders next to the executable) and reads the newest one:
+  - Mihomo Party: `work/config.yaml`;
+  - Clash Nyanpasu: `clash-config.yaml`.
+
+  Profile files are ignored because they aren't what the core runs. When the core is running, the config named on its command line (`mihomo -d … -f …`) is used too.
+- **Live API:** these apps often expose the mihomo API on a **unix socket** (`external-controller-unix`, macOS/Linux/Windows) or a **Windows named pipe** (`external-controller-pipe`) rather than a TCP port. ClaudeGuard talks to all three, with the `secret`. Through the API it sees the node **currently selected** and live Claude connections, as for any Clash.
+- **App names:** configs are named after the app they belong to (Mihomo Party, Clash Nyanpasu, Clash Verge, ClashX, v2rayN…), so messages say which app to fix.
+
+- **Clash Verge Rev** (and the original Clash Verge): ClaudeGuard reads the runtime `clash-verge.yaml` from its data folder (`io.github.clash-verge-rev.clash-verge-rev`, also portable `.config` folders). The `config.yaml` beside it is only a partial override with no rules, so it's ignored. Verge Rev 2.x starts its core with the API on the command line (`-ext-ctl-unix /tmp/verge/verge-mihomo.sock`, or `-ext-ctl-pipe \\.\pipe\verge-mihomo` on Windows, plus `-secret`). ClaudeGuard reads those flags from the running core, so it sees the live selection even though the file doesn't name the API. Any mihomo started with `-ext-ctl*` / `-secret` benefits.
+
+- **Clash for Windows** (also its macOS / Linux builds): ClaudeGuard reads `~/.config/clash/` the way CFW uses it.
+  - **Which profile:** the one selected in `profiles/list.yml` (`index`) is evaluated, with CFW's general settings from `config.yaml` (ports, mode, controller, secret) applied on top.
+  - **Saved selections:** each group's selection saved in `list.yml` is used, so a group CFW has set to DIRECT is caught even without the API.
+  - **API:** CFW starts its core with a random controller and secret on the command line. ClaudeGuard reads those from the running core and uses the live API instead.
+  - **Parsers:** if profile parsers are on (`cfw-settings.yaml`), the menu notes that the rules may differ from the file.
+- **Files with no rules:** a Clash config with no rules (usually a GUI's partial settings file, like CFW's or Verge's `config.yaml`) is reported as **uncertain**, never as "Claude goes DIRECT".
+
+
+### Clash Meta for Android (or any Clash on another device) used as your proxy
+
+A common setup is a phone running **Clash Meta for Android** with *Allow LAN*, and this computer's system proxy, PAC or `HTTPS_PROXY` pointing at it (`192.168.x.x:7890`). The app's files are in Android's private app storage, so they can't be read from a computer, even over USB. What ClaudeGuard can do is ask its **Clash API over the LAN**:
+
+- **Where it looks:** whenever the system proxy, the PAC answer or Claude Code's proxy is another device, ClaudeGuard probes that host's API on ports `9090` and `9097`. For a different port, or an API with a secret, add it yourself:
+  `claudeguard.exe remote-api add 192.168.1.5:9090 <secret>` (admin terminal) (also `list` / `remove`). In CMFA, enable the API under *Override → External controller* with `0.0.0.0:9090`.
+- **If that device sends Claude DIRECT:** Claude would leave through **the phone's own connection**, usually your Iranian mobile IP, which can't be checked from this computer. So Claude Desktop is blocked, and Claude Code's prompt is blocked when its `HTTPS_PROXY` is that device. This is the case even when this computer's own direct connection is fine.
+- **If it proxies Claude:** the normal check through the proxy applies.
+- **Hotspot / USB tethering is different:** the phone's VPN doesn't carry tethered traffic, and that case is already covered, because this computer's exit IP is then the phone's mobile IP.
+
 ## CLI
 
 ```bat

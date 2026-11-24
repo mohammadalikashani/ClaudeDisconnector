@@ -120,7 +120,7 @@ func TestLinkTunToXray(t *testing.T) {
 	xr := filepath.Join(dir, "config.json")
 	os.WriteFile(sb, []byte(sbTunToXray), 0o644)
 	os.WriteFile(xr, []byte(xrayDirectFirst), 0o644)
-	apps := DetectProxyApps(nil, []ConfigCandidate{{"json", sb}, {"json", xr}}, func(string) bool { return true })
+	apps := DetectProxyApps(nil, []ConfigCandidate{{Kind: "json", Path: sb}, {Kind: "json", Path: xr}}, func(string) bool { return true })
 	if len(apps) != 2 {
 		t.Fatalf("apps: %+v", apps)
 	}
@@ -156,8 +156,17 @@ func TestXrayConfdirAndArgs(t *testing.T) {
 	if ConfigArgs("xray", []string{"xray", "run", "-c", "stdin:"}, nil) != nil {
 		t.Error("stdin config should be skipped")
 	}
-	if c := ConfigArgs("clash", []string{"mihomo", "-f", "/x/c.yaml", "-d", "/y"}, nil); len(c) != 2 || c[0].Kind != "clash" || c[1].Path != "/y/config.yaml" {
-		t.Errorf("clash args: %+v", c)
+	// -f wins over -d (the -d folder may hold partial yaml); -d alone means <dir>/config.yaml.
+	if c := ConfigArgs("clash", []string{"mihomo", "-f", "/x/c.yaml", "-d", "/y"}, nil); len(c) != 1 || c[0].Kind != "clash" || c[0].Path != "/x/c.yaml" {
+		t.Errorf("clash args -f -d: %+v", c)
+	}
+	if c := ConfigArgs("clash", []string{"mihomo", "-d", "/y"}, nil); len(c) != 1 || filepath.ToSlash(c[0].Path) != "/y/config.yaml" {
+		t.Errorf("clash args -d: %+v", c)
+	}
+	// Clash Verge Rev starts its core with the API on the command line.
+	c := ConfigArgs("clash", []string{"verge-mihomo", "-d", "/v", "-f", "/v/clash-verge.yaml", "-ext-ctl-unix", "/tmp/verge/verge-mihomo.sock", "-secret", "abc"}, nil)
+	if len(c) != 1 || c[0].API.Unix != "/tmp/verge/verge-mihomo.sock" || c[0].API.Secret != "abc" {
+		t.Errorf("verge args: %+v", c)
 	}
 	for exe, k := range map[string]string{`C:\v2rayN\bin\xray\xray.exe`: "xray", "v2ray": "xray", "mihomo-darwin-arm64": "clash", "sing-box": "sing-box", "v2rayN.exe": ""} {
 		if ProcKind(exe) != k {

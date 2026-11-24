@@ -40,6 +40,15 @@ func RunHook(d HookDeps) (bool, string) {
 	if proxy := ClaudeCodeProxy(d.Getenv); proxy != "" {
 		direct := false
 		for _, a := range s.Apps {
+			if a.ServesPort(proxy) && a.SendsClaudeDirect() && a.Remote != "" {
+				// The proxy is another device (e.g. Clash Meta for Android) that sends Claude
+				// DIRECT: the prompt would leave through THAT device's connection, which
+				// can't be verified from here.
+				return false, "⛔ ClaudeGuard: Claude is blocked - Claude Code's proxy " + proxy + " is " + a.Name() +
+					", which sends Claude traffic DIRECT (" + a.Anthropic.Rule + "), so Claude would use " + a.Remote +
+					"'s own internet connection (unverifiable, likely your Iranian IP).\n" +
+					"Route anthropic.com and claude.ai through a proxy group in that app, then send your prompt again.\n"
+			}
 			if a.ServesPort(proxy) && a.SendsClaudeDirect() {
 				// Claude Code's proxy is Clash/sing-box, whose rules send Claude DIRECT:
 				// the prompt really leaves through the direct route.

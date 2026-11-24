@@ -315,13 +315,24 @@ public enum Xray {
     public static func procKind(_ exe: String) -> String? {
         var n = (exe.split(separator: "/").last.map(String.init) ?? exe).lowercased()
         if n.hasSuffix(".exe") { n.removeLast(4) }
+        if n.hasPrefix("nekobox_core") || n.hasPrefix("nekobox-core") { return "sing-box" }
+        if n.hasPrefix("nekoray_core") || n.hasPrefix("nekoray-core") { return "xray" }
+        if n.contains("nekoray") || n.contains("nekobox") || n == "throne" { return "nekoray" }   // GUI (core gets config over gRPC)
+        if n.contains("shadowrocket") { return "shadowrocket" }
+        if n == "surge" || n.hasPrefix("com.nssurge") { return "surge" }
+        if n.contains("quantumult") { return "quantumultx" }
+        if n == "loon" { return "loon" }
+        if n == "egern" || n.hasPrefix("egern ") { return "egern" }
+        if n == "stash" || n.hasPrefix("stash ") || n.hasPrefix("stashnetwork") || n.hasPrefix("stashpacket") { return "clash" }   // Stash (Clash-based)
         if n.contains("mihomo") || n.contains("clash") || n == "flclash" { return "clash" }
-        if ["sing-box", "singbox", "hiddify", "nekobox", "karing"].contains(where: n.contains) { return "sing-box" }
+        if ["sing-box", "singbox", "hiddify", "karing"].contains(where: n.contains) { return "sing-box" }
         if n.contains("xray") || ["v2ray", "v2ray-core", "wv2ray", "v2ctl"].contains(n) { return "xray" }
         return nil
     }
 
-    /// Config paths named on a proxy core's command line; relative ones resolved against `bases`.
+    /// Config paths named on a proxy core's command line; relative ones resolved against
+    /// `bases`. For mihomo it also picks up the API given on the command line (-ext-ctl /
+    /// -ext-ctl-unix / -secret), as Clash Verge Rev starts its core.
     public static func configArgs(kind: String, args: [String], bases: [String]) -> [ConfigCandidate] {
         var out: [ConfigCandidate] = []
         func add(_ k: String, _ p: String) {
@@ -331,6 +342,9 @@ public enum Xray {
             for b in bases { out.append(.init(kind: k, path: (b as NSString).appendingPathComponent(p))) }
         }
         let jsonKind = kind == "clash" ? "clash" : "json"
+        var dir: String?
+        var haveFile = false
+        var extCtl: String?, extCtlUnix: String?, secret: String?
         var i = 1
         while i < args.count {
             let a = args[i]
@@ -345,13 +359,25 @@ public enum Xray {
             }
             switch flag.trimmingCharacters(in: CharacterSet(charactersIn: "-")) {
             case "c", "config", "f", "file":
-                add(kind == "clash" && val.lowercased().hasSuffix(".json") ? "json" : jsonKind, val)
-            case "confdir": add("xray", val)
-            case "d", "D", "directory":
-                if kind == "clash" { add("clash", val + "/config.yaml") }
-                else if kind == "sing-box" { add("json", val + "/config.json") }
+                add(val.lowercased().hasSuffix(".json") ? "json" : jsonKind, val)
+                haveFile = true
+            case "confdir": add("xray", val); haveFile = true
+            case "d", "D", "directory": dir = val
+            case "ext-ctl": extCtl = val
+            case "ext-ctl-unix": extCtlUnix = val
+            case "secret": secret = val
             default: break
             }
+        }
+        // -d alone means <dir>/config.yaml; with -f the file is the config (the -d folder
+        // may hold other, partial yaml files).
+        if let dir, !haveFile {
+            if kind == "clash" { add("clash", dir + "/config.yaml") } else if kind == "sing-box" { add("json", dir + "/config.json") }
+        }
+        for j in out.indices {
+            out[j].extCtl = extCtl
+            out[j].extCtlUnix = extCtlUnix
+            out[j].secret = secret
         }
         return out
     }

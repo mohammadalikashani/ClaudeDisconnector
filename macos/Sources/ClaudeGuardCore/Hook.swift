@@ -40,6 +40,14 @@ public enum Hook {
 
         var note: String?
         if let proxy = ProxyURL.claudeCode(d.env) {
+            if let a = (s.apps ?? []).first(where: { $0.servesPort(proxy) && $0.sendsClaudeDirect && $0.remote != nil }) {
+                // The proxy is another device (e.g. Clash Meta for Android) sending Claude DIRECT:
+                // the prompt would leave through THAT device's connection - unverifiable here.
+                return (false, "⛔ ClaudeGuard: Claude is blocked - Claude Code's proxy \(proxy) is \(a.name), which sends Claude traffic " +
+                               "DIRECT (\(a.anthropic.rule ?? "?")), so Claude would use \(a.remote!)'s own internet connection " +
+                               "(unverifiable, likely your Iranian IP).\nRoute anthropic.com and claude.ai through a proxy group in that app, " +
+                               "then send your prompt again.\n")
+            }
             if let a = (s.apps ?? []).first(where: { $0.servesPort(proxy) && $0.sendsClaudeDirect }) {
                 // Claude Code's proxy is Clash/sing-box, whose rules send Claude DIRECT:
                 // the prompt really leaves through the direct route.

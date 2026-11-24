@@ -17,6 +17,12 @@ import (
 // UserDirs returns the logged-in console user's profile folder and Roaming AppData
 // (the service runs as SYSTEM, so its own %USERPROFILE% is the wrong one).
 func UserDirs() (home, appData string) {
+	home, appData, _ = UserDirs3()
+	return
+}
+
+// UserDirs3 also returns Local AppData.
+func UserDirs3() (home, appData, localAppData string) {
 	if sid := consoleUserSID(); sid != "" {
 		k, err := registry.OpenKey(registry.LOCAL_MACHINE,
 			`SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\`+sid, registry.QUERY_VALUE)
@@ -26,11 +32,11 @@ func UserDirs() (home, appData string) {
 				if exp, err := registry.ExpandString(p); err == nil {
 					p = exp
 				}
-				return p, filepath.Join(p, "AppData", "Roaming")
+				return p, filepath.Join(p, "AppData", "Roaming"), filepath.Join(p, "AppData", "Local")
 			}
 		}
 	}
-	return os.Getenv("USERPROFILE"), os.Getenv("APPDATA")
+	return os.Getenv("USERPROFILE"), os.Getenv("APPDATA"), os.Getenv("LOCALAPPDATA")
 }
 
 // ProxyProcesses finds running Clash / sing-box / Xray / V2Ray style apps, the
@@ -48,7 +54,7 @@ func ProxyProcesses() core.ProcInfo {
 	for _, p := range listProcs() {
 		n := strings.ToLower(strings.TrimSuffix(strings.ToLower(p.name), ".exe"))
 		kind := core.ProcKind(p.name)
-		if kind == "" && n != "v2rayn" {
+		if kind == "" && n != "v2rayn" && !strings.Contains(n, "hiddify") {
 			continue
 		}
 		if kind != "" {
@@ -63,8 +69,8 @@ func ProxyProcesses() core.ProcInfo {
 		for _, dd := range bases[:2] {
 			addDir(dd)
 		}
-		if kind == "" {
-			continue
+		if kind == "" || kind == "nekoray" {
+			continue // GUIs: no config on their command line
 		}
 		if args := commandLine(p.pid); len(args) > 1 {
 			// Relative config paths: the cwd of another process isn't readable cheaply,

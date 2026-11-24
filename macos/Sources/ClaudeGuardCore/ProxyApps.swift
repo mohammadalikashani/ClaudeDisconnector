@@ -17,7 +17,8 @@ public struct HostRoute: Codable, Equatable {
 }
 
 public struct ProxyApp: Codable, Equatable {
-    public var kind: String            // "clash", "sing-box" or "xray"
+    public var kind: String            // "clash", "sing-box", "xray" or "nekoray"
+    public var app: String?            // client name when known (Hiddify, NekoBox, ...)
     public var source: String
     public var live: Bool
     public var mode: String?
@@ -27,6 +28,9 @@ public struct ProxyApp: Codable, Equatable {
     public var check: HostRoute
     public var liveDirect: [String]?
     public var note: String?
+    /// Host of another device running the app (e.g. Clash Meta for Android used as this
+    /// computer's proxy). Its DIRECT exit is that device's connection.
+    public var remote: String?
 
     public init(kind: String, source: String, live: Bool, mode: String? = nil, tun: Bool? = nil, ports: [Int]? = nil,
                 anthropic: HostRoute, check: HostRoute, liveDirect: [String]? = nil, note: String? = nil) {
@@ -35,6 +39,7 @@ public struct ProxyApp: Codable, Equatable {
     }
 
     public var name: String {
+        if let app { return app }
         switch kind {
         case "clash": return "Clash"
         case "xray": return "Xray/V2Ray"
@@ -51,6 +56,11 @@ public struct ProxyApp: Codable, Equatable {
 
     public func servesPort(_ proxyURL: String?) -> Bool {
         guard let proxyURL, let hp = ProxyURL.hostPort(proxyURL) else { return false }
+        if let remote {
+            guard hp.host.lowercased() == remote.lowercased() else { return false }
+        } else if !RemoteAPIs.isLocal(hp.host) {
+            return false   // a local app doesn't serve another machine's proxy
+        }
         return (ports ?? []).contains(hp.port)
     }
 
@@ -199,7 +209,7 @@ public enum RuleEngine {
             return Tri(t.anthropic)
         }
         if n.contains("!") { return .maybe }
-        let domestic: Set<String> = ["cn", "ir", "iran", "china", "private", "lan", "local", "ads", "adblock",
+        let domestic: Set<String> = ["cn", "ir", "iran", "china", "private", "lan", "local", "ads", "adblock", "system",
                                      "reject", "domestic", "direct"]
         let tokens = n.split(whereSeparator: { "-_@:./ ".contains($0) }).map(String.init)
         if tokens.contains(where: domestic.contains) { return .no }
@@ -268,7 +278,7 @@ public enum RuleEngine {
             let pat = "^" + NSRegularExpression.escapedPattern(for: p.lowercased())
                 .replacingOccurrences(of: "\\*", with: "[^.]*").replacingOccurrences(of: "\\?", with: ".") + "$"
             m = { t, _ in regex(pat, t.host) }
-        case "GEOSITE", "RULESET": m = { t, _ in nameHint(p, t) }
+        case "GEOSITE", "RULESET", "DOMAINSET": m = { t, _ in nameHint(p, t) }   // DOMAIN-SET: Surge / Shadowrocket
         case "GEOIP": m = { t, _ in geoip(p, t, noResolve: noResolve) }
         case "IPCIDR", "IPCIDR6": m = { t, _ in ipCIDR(p, t, noResolve: noResolve) }
         case "DSTPORT": m = { _, _ in port(p, 443) }
@@ -287,7 +297,9 @@ public enum RuleEngine {
         let type = String(line[..<comma]).trimmingCharacters(in: .whitespaces)
         var rest = String(line[line.index(after: comma)...])
         if norm(type) == "MATCH" || norm(type) == "FINAL" {
-            return clashRule(type: type, payload: "", policy: rest.trimmingCharacters(in: .whitespaces), params: [])
+            // "FINAL,PROXY,dns-failed": options after the policy (Surge / Shadowrocket)
+            let parts = rest.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }
+            return clashRule(type: type, payload: "", policy: parts.first ?? "", params: Array(parts.dropFirst()))
         }
         var payload: String
         if rest.trimmingCharacters(in: .whitespaces).hasPrefix("(") {
@@ -316,12 +328,15 @@ public enum RuleEngine {
 
 public struct ClashFile {
     public var controller: String?
+    public var controllerUnix: String?   // external-controller-unix (Mihomo Party, Clash Nyanpasu)
     public var secret: String?
     public var mode = "rule"
     public var tun = false
     public var ports: [Int] = []
     public var rules: [String] = []
     public var groups: [String: [String]] = [:]
+    /// Selections saved by the GUI (Clash for Windows' list.yml), used without an API.
+    public var selected: [String: String] = [:]
 
     /// Reads the parts of a Clash/mihomo YAML config ClaudeGuard needs.
     public static func parse(_ text: String) -> ClashFile {
@@ -362,6 +377,7 @@ public struct ClashFile {
                 section = key
                 switch key {
                 case "external-controller": f.controller = value
+                case "external-controller-unix": f.controllerUnix = value
                 case "secret": f.secret = value
                 case "mode": f.mode = value.lowercased()
                 case "mixed-port", "port", "socks-port": if let p = Int(value), p > 0 { f.ports.append(p) }
@@ -403,23 +419,28 @@ public struct ClashFile {
     /// Without the API the selected member of a group is unknown: a group that can
     /// select DIRECT (directly or through sub-groups) is uncertain.
     public func resolver() -> RuleEngine.Resolver {
-        let groups = self.groups
+        let groups = self.groups, selected = self.selected
         func hasDirect(_ n: String, _ depth: Int) -> Bool {
             if n.uppercased() == "DIRECT" { return true }
             if depth > 8 { return false }
             return (groups[n] ?? []).contains { hasDirect($0, depth + 1) }
         }
-        return { name in
-            switch name.uppercased() {
-            case "DIRECT": return (.direct, [name], false)
-            case "REJECT", "REJECT-DROP": return (.reject, [name], false)
-            default: break
+        return { start in
+            var name = start
+            var chain: [String] = []
+            for _ in 0..<12 {
+                chain.append(name)
+                switch name.uppercased() {
+                case "DIRECT": return (.direct, chain, false)
+                case "REJECT", "REJECT-DROP": return (.reject, chain, false)
+                default: break
+                }
+                guard let members = groups[name] else { return (.proxy, chain, false) }
+                if let now = selected[name], !now.isEmpty { name = now; continue }   // saved selection
+                if hasDirect(name, 0) { return (.unknown, chain, true) }
+                return (.proxy, chain + (members.first.map { [$0 + "?"] } ?? []), false)
             }
-            if let members = groups[name] {
-                if hasDirect(name, 0) { return (.unknown, [name], true) }
-                if let first = members.first { return (.proxy, [name, first + "?"], false) }
-            }
-            return (.proxy, [name], false)
+            return (.unknown, chain, true)
         }
     }
 }
@@ -427,8 +448,17 @@ public struct ClashFile {
 // MARK: - Clash API
 
 struct ClashAPI {
-    let base: String
+    let base: String           // "http://127.0.0.1:9090" or "unix:/path" (also the display name)
     let secret: String?
+    var unixPath: String?
+
+    /// mihomo API on a unix socket (external-controller-unix).
+    init?(unix path: String?, secret: String?) {
+        guard let p = path?.trimmingCharacters(in: .whitespaces), !p.isEmpty else { return nil }
+        base = "unix:" + p
+        unixPath = p
+        self.secret = (secret?.isEmpty ?? true) ? nil : secret
+    }
 
     init?(_ addr: String?, secret: String?) {
         guard var a = addr?.trimmingCharacters(in: .whitespaces), !a.isEmpty else { return nil }
@@ -453,6 +483,12 @@ struct ClashAPI {
     enum APIError: Error { case unauthorized, failed }
 
     func get(_ path: String) async throws -> Any {
+        if let unixPath {
+            let (code, body) = try await Task.detached { try Self.unixGET(unixPath, path, secret: secret) }.value
+            if code == 401 { throw APIError.unauthorized }
+            guard code == 200 else { throw APIError.failed }
+            return try JSONSerialization.jsonObject(with: body)
+        }
         guard let url = URL(string: base + path) else { throw APIError.failed }
         var req = URLRequest(url: url)
         if let secret { req.setValue("Bearer \(secret)", forHTTPHeaderField: "Authorization") }
@@ -461,6 +497,62 @@ struct ClashAPI {
         if code == 401 { throw APIError.unauthorized }
         guard code == 200 else { throw APIError.failed }
         return try JSONSerialization.jsonObject(with: data)
+    }
+
+    /// Minimal HTTP/1.0 GET over a unix socket (blocking, 2 s timeouts).
+    static func unixGET(_ sockPath: String, _ path: String, secret: String?) throws -> (Int, Data) {
+        let fd = socket(AF_UNIX, SOCK_STREAM, 0)
+        guard fd >= 0 else { throw APIError.failed }
+        defer { close(fd) }
+        var tv = timeval(tv_sec: 2, tv_usec: 0)
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
+        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
+        var one: Int32 = 1
+        setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, socklen_t(MemoryLayout<Int32>.size))
+        var addr = sockaddr_un()
+        addr.sun_family = sa_family_t(AF_UNIX)
+        let bytes = Array(sockPath.utf8)
+        guard bytes.count < MemoryLayout.size(ofValue: addr.sun_path) else { throw APIError.failed }
+        withUnsafeMutableBytes(of: &addr.sun_path) { raw in
+            raw.copyBytes(from: bytes)
+            raw[bytes.count] = 0
+        }
+        let ok = withUnsafePointer(to: &addr) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { connect(fd, $0, socklen_t(MemoryLayout<sockaddr_un>.size)) }
+        }
+        guard ok == 0 else { throw APIError.failed }
+        var req = "GET \(path) HTTP/1.0\r\nHost: localhost\r\nAccept: application/json\r\n"
+        if let secret { req += "Authorization: Bearer \(secret)\r\n" }
+        req += "\r\n"
+        let out = Array(req.utf8)
+        guard out.withUnsafeBytes({ send(fd, $0.baseAddress, out.count, 0) }) == out.count else { throw APIError.failed }
+        var data = Data()
+        var buf = [UInt8](repeating: 0, count: 65536)
+        while data.count < 16 << 20 {
+            let n = recv(fd, &buf, buf.count, 0)
+            if n <= 0 { break }
+            data.append(buf, count: n)
+        }
+        guard let split = data.range(of: Data("\r\n\r\n".utf8)) else { throw APIError.failed }
+        let head = String(decoding: data[..<split.lowerBound], as: UTF8.self)
+        let status = head.split(separator: " ").dropFirst().first.flatMap { Int($0) } ?? 0
+        var body = Data(data[split.upperBound...])
+        if head.lowercased().contains("transfer-encoding: chunked") { body = dechunk(body) }
+        return (status, body)
+    }
+
+    static func dechunk(_ d: Data) -> Data {
+        var out = Data()
+        var i = d.startIndex
+        while i < d.endIndex, let crlf = d[i...].range(of: Data("\r\n".utf8)) {
+            let sizeLine = String(decoding: d[i..<crlf.lowerBound], as: UTF8.self).split(separator: ";").first ?? ""
+            guard let size = Int(sizeLine.trimmingCharacters(in: .whitespaces), radix: 16), size > 0 else { break }
+            let start = crlf.upperBound
+            let end = d.index(start, offsetBy: size, limitedBy: d.endIndex) ?? d.endIndex
+            out.append(d[start..<end])
+            i = d.index(end, offsetBy: 2, limitedBy: d.endIndex) ?? d.endIndex
+        }
+        return out
     }
 
     struct State {
@@ -497,7 +589,7 @@ struct ClashAPI {
                 let host = ((md["host"] as? String).flatMap { $0.isEmpty ? nil : $0 } ?? md["sniffHost"] as? String ?? "").lowercased()
                 let isClaude = md["destinationIP"] as? String == NetInfo.anthropicProbeIP
                     || ["anthropic.com", "claude.ai", "claude.com"].contains { RuleEngine.suffix(host, $0) }
-                if isClaude, let chains = conn["chains"] as? [String], chains.first?.uppercased() == "DIRECT" {
+                if isClaude, let chains = conn["chains"] as? [String], (chains.first?.uppercased() == "DIRECT" || chains.first == "bypass") {
                     st.liveDirect.append(host)
                 }
             }
@@ -627,9 +719,19 @@ public enum SingBox {
 // MARK: - Detection
 
 public struct ConfigCandidate {
+    /// "clash", "json" (sing-box or xray), "xray", "nekoray" (settings folder) or "api" (Clash API address)
     public var kind: String
     public var path: String
-    public init(kind: String, path: String) { self.kind = kind; self.path = path }
+    public var app: String?
+    /// Hints from the client's own settings, used when the core config lacks them.
+    public var ports: [Int]?
+    public var tun = false
+    public var note: String?
+    /// mihomo API given on the core's command line (overrides the config).
+    public var extCtl: String?
+    public var extCtlUnix: String?
+    public var secret: String?
+    public init(kind: String, path: String, app: String? = nil) { self.kind = kind; self.path = path; self.app = app }
 }
 
 public struct AppDecision {
@@ -652,7 +754,9 @@ public enum ProxyApps {
     }
 
     public struct ProcInfo {
-        public var running: Set<String> = []        // "clash" / "sing-box" / "xray"
+        public var running: Set<String> = []        // "clash" / "sing-box" / "xray" / "nekoray"
+        public var dirs: [String] = []              // executable folders (and their parents)
+        public init() {}
         public var configs: [ConfigCandidate] = []
     }
 
@@ -669,6 +773,8 @@ public enum ProxyApps {
             guard let (exe, args) = argv(pid), let kind = Xray.procKind(exe) else { continue }
             info.running.insert(kind)
             let exeDir = (exe as NSString).deletingLastPathComponent
+            for d in [exeDir, (exeDir as NSString).deletingLastPathComponent] where !info.dirs.contains(d) { info.dirs.append(d) }
+            if kind == "nekoray" { continue }   // GUI: no config on its command line
             var bases: [String] = []
             if let cwd = cwd(pid), cwd != "/" { bases.append(cwd) }
             bases += [exeDir, (exeDir as NSString).deletingLastPathComponent]
@@ -716,8 +822,6 @@ public enum ProxyApps {
             .init(kind: "clash", path: home + "/.config/mihomo/config.yaml"),
             .init(kind: "clash", path: home + "/.config/clash.meta/config.yaml"),
             .init(kind: "clash", path: home + "/.config/clash/config.yaml"),
-            .init(kind: "clash", path: mac + "/io.github.clash-verge-rev.clash-verge-rev/clash-verge.yaml"),
-            .init(kind: "clash", path: mac + "/io.github.clash-verge-rev.clash-verge-rev/config.yaml"),
             .init(kind: "clash", path: mac + "/v2rayN/binConfigs/config.yaml"),
         ]
         var json = [
@@ -747,13 +851,52 @@ public enum ProxyApps {
         var seenAPI = Set<String>()
         var seenPath = Set<String>()
         for c in cands {
+            if c.kind == "api" {
+                if !seenAPI.contains(c.path), var a = await probeAPI(c.path, secret: c.secret, &seenAPI) {
+                    a.app = c.app
+                    apps.append(a)
+                }
+                continue
+            }
             let path = (c.path as NSString).standardizingPath
             if seenPath.contains(path) { continue }
             seenPath.insert(path)
             var isDir: ObjCBool = false
             guard FileManager.default.fileExists(atPath: path, isDirectory: &isDir) else { continue }
             var app: ProxyApp?
-            if isDir.boolValue {   // xray -confdir
+            if c.kind == "cfw" {
+                guard isDir.boolValue, let a = await GUIApps.evalCFW(path, c, &seenAPI) else { continue }
+                app = a
+            } else if c.kind == "surge" {
+                guard let data = FileManager.default.contents(atPath: path) else { continue }
+                app = await AppleApps.evalSurge(c.path, String(decoding: data, as: UTF8.self), app: c.app ?? "Shadowrocket")
+            } else if c.kind == "egern" {
+                guard let data = FileManager.default.contents(atPath: path) else { continue }
+                app = AppleApps.evalEgern(c.path, String(decoding: data, as: UTF8.self))
+            } else if c.kind == "quantumultx" {
+                guard let data = FileManager.default.contents(atPath: path) else { continue }
+                app = AppleApps.evalQX(c.path, String(decoding: data, as: UTF8.self))
+            } else if c.kind == "flclash" {
+                guard isDir.boolValue, let (fpath, f) = GUIApps.flClashFile(path) else { continue }
+                if fpath == path {   // FlClash folder without its current profile
+                    var a = ProxyApp(kind: "clash", source: path, live: false, anthropic: HostRoute(), check: HostRoute())
+                    a.note = "current profile not found"
+                    a.anthropic.uncertain = true
+                    a.check = a.anthropic
+                    app = a
+                } else {
+                    app = await evalClash(fpath, f, &seenAPI)
+                }
+            } else if c.kind == "nekoray" {
+                guard isDir.boolValue, let (a, api) = GUIApps.evalNekoray(path) else { continue }
+                app = a
+                if let api, let c = ClashAPI("127.0.0.1:\(api.port)", secret: api.secret), let st = try? await c.fetch() {
+                    seenAPI.insert(c.hostPort)
+                    app?.live = true
+                    app?.source += " + API \(c.base)"
+                    if !st.liveDirect.isEmpty { app?.liveDirect = st.liveDirect }
+                }
+            } else if isDir.boolValue {   // xray -confdir
                 if let cfg = Xray.load(path), !(cfg["outbounds"] as? [Any] ?? []).isEmpty {
                     app = Xray.evaluate(path: c.path, cfg)
                 }
@@ -761,8 +904,11 @@ public enum ProxyApps {
                 guard let data = FileManager.default.contents(atPath: path), !data.isEmpty else { continue }
                 let kind = c.kind == "clash" ? "clash" : Xray.jsonKind(data)
                 if kind == "clash" {
-                    let f = ClashFile.parse(String(decoding: data, as: UTF8.self))
-                    if f.rules.isEmpty && f.controller == nil { continue }
+                    var f = ClashFile.parse(String(decoding: data, as: UTF8.self))
+                    if f.rules.isEmpty && f.controller == nil && f.controllerUnix == nil { continue }
+                    if let v = c.extCtl { f.controller = v }
+                    if let v = c.extCtlUnix { f.controllerUnix = v }
+                    if let v = c.secret { f.secret = v }
                     app = await evalClash(c.path, f, &seenAPI)
                 } else if kind == "xray" {
                     if let cfg = Xray.load(path), !(cfg["outbounds"] as? [Any] ?? []).isEmpty {
@@ -773,30 +919,80 @@ public enum ProxyApps {
                     app = await evalSingBox(c.path, obj, outbounds, &seenAPI)
                 }
             }
-            guard let a = app else { continue }
+            guard var a = app else { continue }
+            if let name = c.app { a.app = name } else if a.app == nil { a.app = GUIApps.appLabel(path) }
+            if (a.ports ?? []).isEmpty, let p = c.ports { a.ports = p }
+            if c.tun { a.tun = true }
+            if let n = c.note { a.note = a.note.map { "\(n); \($0)" } ?? n }
             if !a.live && !running(a.kind) { continue }   // config of an app that isn't running
             apps.append(a)
         }
         guard probeDefaults else { Xray.linkLocalForwards(&apps); return apps }
         for addr in defaultAPIs where !seenAPI.contains(addr) {
-            guard let api = ClashAPI(addr, secret: nil), let st = try? await api.fetch() else { continue }
-            seenAPI.insert(addr)
-            let kind = st.version.lowercased().contains("sing-box") ? "sing-box" : "clash"
-            var app = ProxyApp(kind: kind, source: "API \(api.base)", live: true, mode: st.mode, tun: st.tun,
-                               ports: st.ports, anthropic: HostRoute(), check: HostRoute(),
-                               liveDirect: st.liveDirect.isEmpty ? nil : st.liveDirect)
-            if st.rules == nil && st.mode != "global" && st.mode != "direct" {
-                app.note = "rules not available from the API (no config file found)"
-                app.anthropic.uncertain = true
-                app.check = app.anthropic
-            } else {
-                (app.anthropic, app.check) = RuleEngine.evalClash(st.rules ?? [], mode: st.mode ?? "rule",
-                                                                  resolve: ClashAPI.resolver(st.proxies ?? [:]))
-            }
-            apps.append(app)
+            if let a = await probeAPI(addr, &seenAPI) { apps.append(a) }
         }
         Xray.linkLocalForwards(&apps)
         return apps
+    }
+
+    /// Asks a Clash-compatible API with no config file known (nil if it doesn't answer).
+    static func probeAPI(_ addr: String, secret: String? = nil, _ seenAPI: inout Set<String>) async -> ProxyApp? {
+        guard let api = ClashAPI(addr, secret: secret), let st = try? await api.fetch() else { return nil }
+        seenAPI.insert(api.hostPort)
+        let kind = st.version.lowercased().contains("sing-box") ? "sing-box" : "clash"
+        var app = ProxyApp(kind: kind, source: "API \(api.base)", live: true, mode: st.mode, tun: st.tun,
+                           ports: st.ports, anthropic: HostRoute(), check: HostRoute(),
+                           liveDirect: st.liveDirect.isEmpty ? nil : st.liveDirect)
+        if st.rules == nil && st.mode != "global" && st.mode != "direct" {
+            app.note = "rules not available from the API (no config file found)"
+            app.anthropic.uncertain = true
+            app.check = app.anthropic
+        } else {
+            (app.anthropic, app.check) = RuleEngine.evalClash(st.rules ?? [], mode: st.mode ?? "rule",
+                                                              resolve: ClashAPI.resolver(st.proxies ?? [:]))
+        }
+        if let hp = ProxyURL.hostPort(api.base), !RemoteAPIs.isLocal(hp.host) {
+            app.remote = hp.host
+            app.tun = false   // its TUN is on the other device
+        }
+        return app
+    }
+
+    /// Every config worth reading: command-line configs of running cores, well-known
+    /// locations, Hiddify's data folders / preferences and NekoRay's settings.
+    public static func allCandidates(home: String, procs: ProcInfo) -> [ConfigCandidate] {
+        let lib = home + "/Library"
+        let hiddify = GUIApps.findHiddify(
+            roots: [lib + "/Application Support", lib + "/Group Containers", lib + "/Containers", home + "/.local/share"],
+            plists: [lib + "/Preferences/app.hiddify.com.plist",
+                     lib + "/Containers/app.hiddify.com/Data/Library/Preferences/app.hiddify.com.plist"])
+        let roots = [lib + "/Application Support", lib + "/Group Containers", lib + "/Containers", home + "/.local/share"]
+        GUIApps.flClashPlists = [lib + "/Preferences/com.follow.clash.plist",
+                                 lib + "/Containers/com.follow.clash/Data/Library/Preferences/com.follow.clash.plist"]
+        // ClashX's folders: only its selected profile counts (other yaml there isn't running).
+        let clashX = GUIApps.clashXCandidates(home: home)
+        let clashXDirs = Set(clashX.map { ($0.path as NSString).deletingLastPathComponent })
+        var generic = candidates(home: home).filter { !clashXDirs.contains(($0.path as NSString).deletingLastPathComponent) }
+        var procConfigs = procs.configs
+        var cfw: [ConfigCandidate] = []
+        // Clash for Windows: its folder is evaluated as a whole (profile + settings), and its
+        // core's command-line API (-ext-ctl / -secret) is handed over.
+        if let dir = GUIApps.cfwDir(home: home) {
+            var c = ConfigCandidate(kind: "cfw", path: dir, app: "Clash for Windows")
+            procConfigs = procConfigs.filter { p in
+                guard p.kind == "clash", (p.path as NSString).deletingLastPathComponent == dir else { return true }
+                if p.extCtl != nil || p.secret != nil { c.extCtl = p.extCtl; c.extCtlUnix = p.extCtlUnix; c.secret = p.secret }
+                return false
+            }
+            generic = generic.filter { ($0.path as NSString).deletingLastPathComponent != dir }
+            cfw = [c]
+        }
+        return cfw + procConfigs + clashX.filter { c in !cfw.contains { ($0.path) == (c.path as NSString).deletingLastPathComponent } } + generic + hiddify.configs + GUIApps.flClashCandidates(roots)
+            + GUIApps.karingCandidates(roots + [home + "/Documents"]) + GUIApps.nekorayDirs(home: home, exeDirs: procs.dirs)
+            + AppleApps.shadowrocketCandidates(AppleApps.roots(home: home)) + AppleApps.stashCandidates(AppleApps.roots(home: home))
+            + AppleApps.surgeCandidates(AppleApps.roots(home: home)) + AppleApps.quantumultXCandidates(AppleApps.roots(home: home))
+            + AppleApps.loonCandidates(AppleApps.roots(home: home)) + AppleApps.egernCandidates(AppleApps.roots(home: home))
+            + GUIApps.mihomoGUICandidates(roots + [home + "/.config"] + procs.dirs.flatMap { [$0, $0 + "/.config", $0 + "/data"] })
     }
 
     static func evalClash(_ path: String, _ f: ClashFile, _ seenAPI: inout Set<String>) async -> ProxyApp {
@@ -804,7 +1000,13 @@ public enum ProxyApps {
                            anthropic: HostRoute(), check: HostRoute())
         var rules = f.rules.compactMap(RuleEngine.parseClashLine)
         var resolve = f.resolver()
-        if let api = ClashAPI(f.controller, secret: f.secret) {
+        var apis = [ClashAPI(f.controller, secret: f.secret)].compactMap { $0 }
+        if var u = f.controllerUnix, !u.isEmpty {
+            if !u.hasPrefix("/") { u = ((path as NSString).deletingLastPathComponent as NSString).appendingPathComponent(u) }
+            if let a = ClashAPI(unix: u, secret: f.secret) { apis.append(a) }
+        }
+        var notes: [String] = []
+        for api in apis where !app.live {
             do {
                 let st = try await api.fetch()
                 seenAPI.insert(api.hostPort)
@@ -817,10 +1019,19 @@ public enum ProxyApps {
                 if let p = st.proxies { resolve = ClashAPI.resolver(p) }
                 if !st.liveDirect.isEmpty { app.liveDirect = st.liveDirect }
             } catch ClashAPI.APIError.unauthorized {
-                app.note = "API \(api.base): API needs the secret"
+                notes.append("API \(api.base): API needs the secret")
             } catch {
-                app.note = "API \(api.base): not reachable"
+                notes.append("API \(api.base): not reachable")
             }
+        }
+        if !app.live && !notes.isEmpty { app.note = notes.joined(separator: "; ") }
+        if rules.isEmpty && app.mode != "direct" && app.mode != "global" {
+            // A config without rules is usually a GUI's partial settings file (the rules live
+            // elsewhere), not what the core runs: don't conclude DIRECT from it.
+            app.anthropic.uncertain = true
+            app.anthropic.rule = "no rules in this file"
+            app.check = app.anthropic
+            return app
         }
         (app.anthropic, app.check) = RuleEngine.evalClash(rules, mode: app.mode ?? "rule", resolve: resolve)
         return app

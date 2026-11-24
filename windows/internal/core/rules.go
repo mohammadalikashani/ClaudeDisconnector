@@ -172,7 +172,7 @@ func nameHint(name string, t target) tri {
 	// Domestic / ad / LAN lists never contain Anthropic or the IP-check sites.
 	for _, tok := range strings.FieldsFunc(n, func(r rune) bool { return strings.ContainsRune("-_@:./ ", r) }) {
 		switch tok {
-		case "cn", "ir", "iran", "china", "private", "lan", "local", "ads", "adblock", "reject", "domestic", "direct":
+		case "cn", "ir", "iran", "china", "private", "lan", "local", "ads", "adblock", "reject", "domestic", "direct", "system":
 			return no
 		}
 	}
@@ -295,7 +295,7 @@ func ClashRule(typ, payload, policy string, params []string) Rule {
 			}
 			return boolTri(re.MatchString(t.host))
 		}
-	case "GEOSITE", "RULESET":
+	case "GEOSITE", "RULESET", "DOMAINSET": // DOMAIN-SET: Surge / Shadowrocket
 		m = func(t target, _ string) tri { return nameHint(payload, t) }
 	case "GEOIP":
 		m = func(t target, _ string) tri { return geoipTri(payload, t, noResolve) }
@@ -324,7 +324,8 @@ func ParseClashRuleLine(line string) (Rule, bool) {
 	}
 	typ, rest, _ := strings.Cut(line, ",")
 	if nt := normType(typ); nt == "MATCH" || nt == "FINAL" {
-		return ClashRule(typ, "", strings.TrimSpace(rest), nil), true
+		policy, _, _ := strings.Cut(rest, ",") // "FINAL,PROXY,dns-failed" (Surge-style options)
+		return ClashRule(typ, "", strings.TrimSpace(policy), nil), true
 	}
 	var payload string
 	if strings.HasPrefix(strings.TrimSpace(rest), "(") { // AND,((...),(...)),Policy

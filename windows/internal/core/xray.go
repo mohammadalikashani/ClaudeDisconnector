@@ -583,7 +583,7 @@ func (a ProxyApp) servesPortNum(p int) bool {
 // ProcInfo describes the running proxy apps found by the platform layer.
 type ProcInfo struct {
 	Dirs    []string        // executable folders (and their parents)
-	Running map[string]bool // "clash" / "sing-box" / "xray"
+	Running map[string]bool // "clash" / "sing-box" / "xray" / "nekoray"
 	Configs []ConfigCandidate
 }
 
@@ -594,10 +594,16 @@ func ProcKind(exe string) string {
 	n := strings.ToLower(filepath.Base(strings.ReplaceAll(exe, `\`, "/")))
 	n = strings.TrimSuffix(n, ".exe")
 	switch {
+	case strings.HasPrefix(n, "nekobox_core") || strings.HasPrefix(n, "nekobox-core"):
+		return "sing-box"
+	case strings.HasPrefix(n, "nekoray_core") || strings.HasPrefix(n, "nekoray-core"):
+		return "xray"
+	case strings.Contains(n, "nekoray") || strings.Contains(n, "nekobox") || n == "throne":
+		return "nekoray" // GUI (its core gets the config over gRPC)
 	case strings.Contains(n, "mihomo") || strings.Contains(n, "clash") || n == "flclash":
 		return "clash"
 	case strings.Contains(n, "sing-box") || strings.Contains(n, "singbox") || strings.Contains(n, "hiddify") ||
-		strings.Contains(n, "nekobox") || strings.Contains(n, "karing"):
+		strings.Contains(n, "karing"):
 		return "sing-box"
 	case strings.Contains(n, "xray") || n == "v2ray" || n == "v2ray-core" || n == "wv2ray" || n == "v2ctl":
 		return "xray"
@@ -606,7 +612,9 @@ func ProcKind(exe string) string {
 }
 
 // ConfigArgs extracts config paths from a proxy core's command line. Relative paths
-// are tried against each of bases (process cwd, exe folder, ...).
+// are tried against each of bases (process cwd, exe folder, ...). For mihomo it also
+// picks up the API given on the command line (-ext-ctl / -ext-ctl-unix / -ext-ctl-pipe /
+// -secret), as Clash Verge Rev starts its core.
 func ConfigArgs(kind string, args []string, bases []string) []ConfigCandidate {
 	var out []ConfigCandidate
 	add := func(k, p string) {
@@ -615,17 +623,20 @@ func ConfigArgs(kind string, args []string, bases []string) []ConfigCandidate {
 			return
 		}
 		if filepath.IsAbs(p) || strings.HasPrefix(p, "/") || len(bases) == 0 {
-			out = append(out, ConfigCandidate{k, p})
+			out = append(out, ConfigCandidate{Kind: k, Path: p})
 			return
 		}
 		for _, b := range bases {
-			out = append(out, ConfigCandidate{k, filepath.Join(b, p)})
+			out = append(out, ConfigCandidate{Kind: k, Path: filepath.Join(b, p)})
 		}
 	}
 	jsonKind := kind
 	if kind == "sing-box" || kind == "xray" {
 		jsonKind = "json" // decided by content
 	}
+	var dir string
+	var api APIOverride
+	haveFile := false
 	for i := 1; i < len(args); i++ {
 		a := args[i]
 		flag, val, hasEq := strings.Cut(a, "=")
@@ -645,14 +656,34 @@ func ConfigArgs(kind string, args []string, bases []string) []ConfigCandidate {
 				k = "json"
 			}
 			add(k, val)
+			haveFile = true
 		case "confdir":
 			add("xray", val)
+			haveFile = true
 		case "d", "D", "directory":
-			if kind == "clash" {
-				add("clash", filepath.Join(val, "config.yaml"))
-			} else if kind == "sing-box" {
-				add("json", filepath.Join(val, "config.json"))
-			}
+			dir = val
+		case "ext-ctl":
+			api.Addr = val
+		case "ext-ctl-unix":
+			api.Unix = val
+		case "ext-ctl-pipe":
+			api.Pipe = val
+		case "secret":
+			api.Secret = val
+		}
+	}
+	// -d alone means <dir>/config.yaml; with -f the file is the config (the -d folder
+	// may hold other, partial yaml files).
+	if dir != "" && !haveFile {
+		if kind == "clash" {
+			add("clash", filepath.Join(dir, "config.yaml"))
+		} else if kind == "sing-box" {
+			add("json", filepath.Join(dir, "config.json"))
+		}
+	}
+	if api != (APIOverride{}) {
+		for i := range out {
+			out[i].API = api
 		}
 	}
 	return out

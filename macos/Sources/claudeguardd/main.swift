@@ -8,7 +8,7 @@ usage: claudeguardd <command>      (installed as `claudeguard`)
   check           check the direct route and Claude Desktop's route (system proxy / PAC) once
   check-via <url> check the route through a specific proxy, e.g. http://127.0.0.1:10809
   check-iface <if> check the exit IP of one network interface, e.g. en0 (bypassing any TUN VPN)
-  check-apps [files...] show how Clash / sing-box / Xray route Claude (auto-detected, or given config files)
+  check-apps [files/dirs] show how Clash / sing-box / Xray / Hiddify / NekoBox route Claude (auto-detected, or given config files)
   check-pac <url> evaluate a PAC file for Claude's hosts and check that route
   status          print the current protection status
   refresh         ask the service to re-check your IP now
@@ -16,6 +16,9 @@ usage: claudeguardd <command>      (installed as `claudeguard`)
                   route Claude Code through v2ray's HTTP proxy (system-proxy mode).
                   Claude Code ignores the macOS system proxy, so this sets HTTPS_PROXY
                   for it in ~/.claude/settings.json.
+  remote-api list | add <host:port> [secret] | remove <host:port>
+                  a Clash API on another device you use as your proxy, e.g. Clash Meta
+                  for Android with Allow LAN (proxy hosts are probed on 9090/9097 anyway; root)
   hook            Claude Code UserPromptSubmit hook
   cleanup         remove all blocks (root; used by uninstall.sh)
   lookup <ip>     print the country of an IP address (for testing)
@@ -52,7 +55,7 @@ func printVerdict(_ title: String, _ v: Verdict) {
 
 func printApp(_ a: ProxyApp) {
     print("\(a.sendsClaudeDirect ? "⚠️  " : "")\(a.describe)")
-    print("    source: \(a.source)\n    mode=\(a.mode ?? "-") tun=\(a.tun ?? false) ports=\(a.ports ?? []) live=\(a.live)")
+    print("    source: \(a.source)\n    mode=\(a.mode ?? "-") tun=\(a.tun ?? false) ports=\(a.ports ?? []) live=\(a.live)" + (a.remote.map { " remote=\($0) (another device: its DIRECT is that device's own connection)" } ?? ""))
     print("    IP-check sites -> \(a.check.outcome.rawValue)\(a.checkMisrouted ? "  (misrouted: checks can't see Claude's exit)" : "")")
     if let n = a.note { print("    note: \(n)") }
 }
@@ -163,9 +166,14 @@ case "check":
         let net = NetInfo.current()
         print("Network: \(net.summary)")
         let procs = ProxyApps.processes()
-        let apps = await ProxyApps.detect(procs.configs + ProxyApps.candidates(home: ProxyApps.consoleUserHome()),
+        let home = ProxyApps.consoleUserHome()
+        let sp0 = SystemProxy.current()
+        let rt0 = sp0.enabled || sp0.pac != nil ? await PAC.resolveDesktopRoute(sp0) : nil
+        let remote = RemoteAPIs.candidates(proxies: [ClaudeSettings.proxy(home: home), rt0?.proxy, rt0?.http],
+                                           configured: RemoteAPIs.load())
+        let apps = await ProxyApps.detect(ProxyApps.allCandidates(home: home, procs: procs) + remote,
                                           running: { procs.running.contains($0) })
-        if apps.isEmpty { print("Apps: no running Clash / sing-box / Xray / V2Ray detected") }
+        if apps.isEmpty { print("Apps: no running Clash / sing-box / Xray / V2Ray / Hiddify / NekoBox / FlClash / Karing / Mihomo Party / Nyanpasu / Shadowrocket / Stash / Surge / Quantumult X / Loon / Egern detected") }
         for a in apps { printApp(a) }
         let direct: Verdict
         if net.anthropicBypassesCheck, let iface = net.anthropicIface {
@@ -215,8 +223,23 @@ case "check-apps":
         let files = Array(args.dropFirst())
         let procs = ProxyApps.processes()
         let cands = files.isEmpty
-            ? procs.configs + ProxyApps.candidates(home: ProxyApps.consoleUserHome())
-            : files.map { ConfigCandidate(kind: $0.hasSuffix(".yaml") || $0.hasSuffix(".yml") ? "clash" : "json", path: $0) }
+            ? ProxyApps.allCandidates(home: ProxyApps.consoleUserHome(), procs: procs) + RemoteAPIs.candidates(
+                proxies: [ClaudeSettings.proxy(home: ProxyApps.consoleUserHome()), SystemProxy.current().http],
+                configured: RemoteAPIs.load())
+            : files.map { f -> ConfigCandidate in
+                if FileManager.default.fileExists(atPath: f + "/groups") { return ConfigCandidate(kind: "nekoray", path: f) }
+                if f.lowercased().contains("egern") && (f.hasSuffix(".yaml") || f.hasSuffix(".yml")) {
+                    return ConfigCandidate(kind: "egern", path: f, app: "Egern")
+                }
+                if f.hasSuffix(".conf") || f.hasSuffix(".txt") || f.hasSuffix(".lcf") {
+                    let text = (try? String(contentsOfFile: f, encoding: .utf8))?.lowercased() ?? ""
+                    if text.contains("[filter_local]") || text.contains("[policy]") { return ConfigCandidate(kind: "quantumultx", path: f, app: "Quantumult X") }
+                    let app = text.contains("[remote rule]") ? "Loon"
+                        : text.contains("http-api") || text.contains("#!managed-config") ? "Surge" : "Shadowrocket"
+                    return ConfigCandidate(kind: "surge", path: f, app: app)
+                }
+                return ConfigCandidate(kind: f.hasSuffix(".yaml") || f.hasSuffix(".yml") ? "clash" : "json", path: f)
+            }
         let apps = await ProxyApps.detect(cands, running: { !files.isEmpty || procs.running.contains($0) }, probeDefaults: files.isEmpty)
         if apps.isEmpty { print("no Clash / sing-box / Xray config or API found") }
         for a in apps { printApp(a) }
@@ -247,6 +270,15 @@ case "refresh":
 
 case "claude-proxy":
     claudeProxy(Array(args.dropFirst()))
+
+case "remote-api":
+    do {
+        print(try RemoteAPIs.command(Array(args.dropFirst())), terminator: "")
+        if args.count > 1 && args[1] != "list" { GuardNotify.post(GuardNotify.refresh) }
+    } catch {
+        print(error)
+        exit(1)
+    }
 
 case "hook":
     hook()

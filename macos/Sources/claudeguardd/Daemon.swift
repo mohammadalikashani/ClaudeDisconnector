@@ -102,14 +102,18 @@ final class Daemon {
             info.bound = bypass
             let net = info
 
-            // Clash / sing-box: read their configs + APIs to see how they route Claude.
-            let procs = ProxyApps.processes()
-            let apps = await ProxyApps.detect(procs.configs + ProxyApps.candidates(home: ProxyApps.consoleUserHome()),
-                                              running: { procs.running.contains($0) })
             var route: DesktopRoute?
             if system.enabled || system.pac != nil {
                 route = await PAC.resolveDesktopRoute(system)   // evaluates the PAC file in PAC mode
             }
+            // Proxy apps: read their configs + APIs to see how they route Claude, including a
+            // Clash on ANOTHER device used as the proxy (Clash Meta for Android).
+            let procs = ProxyApps.processes()
+            let home = ProxyApps.consoleUserHome()
+            let remote = RemoteAPIs.candidates(proxies: [ClaudeSettings.proxy(home: home), route?.proxy, route?.http],
+                                               configured: RemoteAPIs.load())
+            let apps = await ProxyApps.detect(ProxyApps.allCandidates(home: home, procs: procs) + remote,
+                                              running: { procs.running.contains($0) })
             let decision = ProxyApps.decide(apps, anthropicInTunnel: net.anthropicIsTunnel == true || net.checkIsTunnel == true,
                                             desktopProxy: route?.proxy)
 
@@ -136,7 +140,12 @@ final class Daemon {
             }
             var proxy: Verdict?
             if let p = route?.proxy {
-                if decision.proxyDirect != nil {
+                if let a = decision.proxyDirect, let host = a.remote {
+                    // The proxy is another device sending Claude DIRECT: Claude leaves through that
+                    // device's own connection, which can't be checked from here.
+                    proxy = Verdict(kind: .unknown, detail: "\(a.name) sends Claude DIRECT through \(host)'s own internet connection, " +
+                                                          "which can't be verified from this Mac.")
+                } else if decision.proxyDirect != nil {
                     proxy = physicalVerdict ?? direct   // non-TUN app: its DIRECT follows the normal route
                 } else {
                     proxy = await checker.check(via: p)
@@ -204,6 +213,9 @@ final class Daemon {
         if let a = r.decision.tunDirect {
             msg = "\(a.name) sends Claude traffic DIRECT (\(a.anthropic.rule ?? "?")), so Claude uses your real connection" +
                   (r.physical.map { " (\($0))" } ?? "") + ". Route anthropic.com and claude.ai through your proxy (group / outbound). " + msg
+        } else if let a = r.decision.proxyDirect, let host = a.remote {
+            msg += " \(a.name) (your proxy on \(host)) sends Claude traffic DIRECT (\(a.anthropic.rule ?? "?")), so Claude Desktop would use " +
+                   "that device's own connection - blocked. Route anthropic.com and claude.ai through a proxy group there."
         } else if let a = r.decision.proxyDirect {
             msg += " \(a.name) (behind your system proxy) sends Claude traffic DIRECT (\(a.anthropic.rule ?? "?")), so Claude Desktop is treated as direct."
         }

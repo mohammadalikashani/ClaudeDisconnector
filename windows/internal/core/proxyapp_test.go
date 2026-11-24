@@ -20,7 +20,7 @@ func writeTemp(t *testing.T, name, content string) string {
 }
 
 func detect(t *testing.T, kind, path string) ProxyApp {
-	apps := DetectProxyApps(context.Background(), []ConfigCandidate{{kind, path}}, func(string) bool { return true })
+	apps := DetectProxyApps(context.Background(), []ConfigCandidate{{Kind: kind, Path: path}}, func(string) bool { return true })
 	for _, a := range apps {
 		if strings.Contains(a.Source, path) {
 			return a
@@ -223,7 +223,7 @@ func TestClashAPI(t *testing.T) {
 
 func TestStaleConfigIgnored(t *testing.T) {
 	p := writeTemp(t, "old.yaml", clashBypassAll)
-	apps := DetectProxyApps(context.Background(), []ConfigCandidate{{"clash", p}}, func(string) bool { return false })
+	apps := DetectProxyApps(context.Background(), []ConfigCandidate{{Kind: "clash", Path: p}}, func(string) bool { return false })
 	for _, a := range apps {
 		if strings.Contains(a.Source, p) {
 			t.Error("config of a non-running app should be ignored")

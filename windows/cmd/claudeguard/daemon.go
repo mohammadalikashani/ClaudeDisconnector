@@ -110,14 +110,21 @@ func runDaemon(stop <-chan struct{}) {
 			bypass := ni.AnthropicBypassesCheck()
 			ni.Bound = bypass && anthropicLocal != nil
 
-			// Clash / sing-box: read their configs + APIs to see how they route Claude.
-			home, appData := win.UserDirs()
-			procs := win.ProxyProcesses()
-			r.apps = core.DetectProxyApps(ctx, append(procs.Configs, core.CandidateConfigs(home, appData, procs.Dirs)...), procs.IsRunning)
 			if sp.Enabled() || sp.PAC != "" {
 				route := core.ResolveDesktopRoute(ctx, sp) // evaluates the PAC file in PAC mode
 				r.route = &route
 			}
+			// Clash / sing-box / ...: read their configs + APIs to see how they route Claude,
+			// including a Clash on ANOTHER device used as the proxy (Clash Meta for Android).
+			home, appData, localAppData := win.UserDirs3()
+			procs := win.ProxyProcesses()
+			cands := core.AllCandidates(home, appData, localAppData, procs)
+			proxies := []string{core.ClaudeSettingsProxyIn(home)}
+			if r.route != nil {
+				proxies = append(proxies, r.route.Proxy, r.route.HTTP)
+			}
+			cands = append(cands, core.RemoteAPICandidates(proxies, core.LoadRemoteAPIs(core.RemoteAPIsFile()))...)
+			r.apps = core.DetectProxyApps(ctx, cands, procs.IsRunning)
 			desktopProxy := ""
 			if r.route != nil {
 				desktopProxy = r.route.Proxy
@@ -153,6 +160,12 @@ func runDaemon(stop <-chan struct{}) {
 			}
 			if r.route != nil && r.route.Proxy != "" {
 				switch {
+				case r.dec.ProxyDirect != nil && r.dec.ProxyDirect.Remote != "":
+					// The proxy is another device whose rules send Claude DIRECT: Claude leaves
+					// through that device's own connection, which can't be checked from here.
+					v := core.Verdict{Kind: core.VerdictUnknown, Detail: r.dec.ProxyDirect.Name() +
+						" sends Claude DIRECT through " + r.dec.ProxyDirect.Remote + "'s own internet connection, which can't be verified from this computer."}
+					r.proxy = &v
 				case r.dec.ProxyDirect != nil && physical != nil:
 					r.proxy = physical
 				case r.dec.ProxyDirect != nil:
@@ -240,7 +253,12 @@ func runDaemon(stop <-chan struct{}) {
 			msg = a.Name() + " sends Claude traffic DIRECT (" + a.Anthropic.Rule + "), so Claude uses your real connection" +
 				physNote(r.physIF) + ". Route anthropic.com and claude.ai through your proxy (group / outbound). " + msg
 		} else if a := r.dec.ProxyDirect; a != nil {
-			msg += " " + a.Name() + " (behind your system proxy) sends Claude traffic DIRECT (" + a.Anthropic.Rule + "), so Claude Desktop is treated as direct."
+			if a.Remote != "" {
+				msg += " " + a.Name() + " (your proxy on " + a.Remote + ") sends Claude traffic DIRECT (" + a.Anthropic.Rule +
+					"), so Claude Desktop would use that device's own connection - blocked. Route anthropic.com and claude.ai through a proxy group there."
+			} else {
+				msg += " " + a.Name() + " (behind your system proxy) sends Claude traffic DIRECT (" + a.Anthropic.Rule + "), so Claude Desktop is treated as direct."
+			}
 		}
 		if a := r.dec.Misrouted; a != nil && state == core.StateBlocked {
 			msg += " Note: " + a.Name() + " sends Claude through the proxy but the IP-check sites DIRECT, so ClaudeGuard sees your real IP. " +
