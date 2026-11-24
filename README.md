@@ -41,3 +41,7 @@ See the platform READMEs for how each piece works, the CLI commands, supported V
 ## Limitations
 
 An administrator can stop the service or remove the rules. ClaudeGuard protects you from accidents, not from yourself. Each network change blocks Claude for a few seconds while it re-checks.
+
+## License
+
+[MIT](LICENSE)
